@@ -1,10 +1,33 @@
 import torch
 import torch.nn as nn
-from configs import B16Config
+import configs
 import math
 
+ATTENTION_Q = "MultiHeadDotProductAttention_1/query"
+ATTENTION_K = "MultiHeadDotProductAttention_1/key"
+ATTENTION_V = "MultiHeadDotProductAttention_1/value"
+ATTENTION_OUT = "MultiHeadDotProductAttention_1/out"
+FC_0 = "MlpBlock_3/Dense_0"
+FC_1 = "MlpBlock_3/Dense_1"
+ATTENTION_NORM = "LayerNorm_0"
+MLP_NORM = "LayerNorm_2"
+
+
+def np2th(weights,conv=False):
+    weights = torch.from_numpy(weights)
+    if conv:
+        weights = weights.permute(3,2,0,1)
+    return weights
+
+def pjoin(*parts):
+    key = "/".join(parts)
+    return key
+
+
+
+
 class Embeddings(nn.Module):
-    def __init__(self,config:B16Config):
+    def __init__(self,config):
         super().__init__()
         self.config = config
         self.token_embeddings = nn.Conv2d(
@@ -29,7 +52,7 @@ class Embeddings(nn.Module):
         return inputs
 
 class Attention(nn.Module):
-    def __init__(self,vis,config:B16Config):
+    def __init__(self,vis,config):
         super().__init__()
         self.config = config
         self.vis = vis
@@ -67,7 +90,7 @@ class Attention(nn.Module):
         return outputs,weights
 
 class Mlp(nn.Module):
-    def __init__(self,config:B16Config):
+    def __init__(self,config):
         super().__init__()
         self.fc1 = nn.Linear(config.hidden_size,config.transformer.mlp_dim)
         self.fc2 = nn.Linear(config.transformer.mlp_dim,config.hidden_size)
@@ -87,7 +110,7 @@ class Mlp(nn.Module):
         return inputs
 
 class Block(nn.Module):
-    def __init__(self,vis,config:B16Config):
+    def __init__(self,vis,config):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -106,8 +129,46 @@ class Block(nn.Module):
         x = x+residual
         return x,weights
 
+    def load_from(self, weights, n_block):
+        ROOT = f"Transformer/encoderblock_{n_block}"
+        with torch.no_grad():
+            query_weight = np2th(weights[pjoin(ROOT, ATTENTION_Q, "kernel")]).view(self.hidden_size,                                                                                   self.hidden_size).t()
+            key_weight = np2th(weights[pjoin(ROOT, ATTENTION_K, "kernel")]).view(self.hidden_size, self.hidden_size).t()
+            value_weight = np2th(weights[pjoin(ROOT, ATTENTION_V, "kernel")]).view(self.hidden_size,                                                                                  self.hidden_size).t()
+            out_weight = np2th(weights[pjoin(ROOT, ATTENTION_OUT, "kernel")]).view(self.hidden_size,
+                                                                                   self.hidden_size).t()
+            query_bias = np2th(weights[pjoin(ROOT, ATTENTION_Q, "bias")]).view(-1)
+            key_bias = np2th(weights[pjoin(ROOT, ATTENTION_K, "bias")]).view(-1)
+            value_bias = np2th(weights[pjoin(ROOT, ATTENTION_V, "bias")]).view(-1)
+            out_bias = np2th(weights[pjoin(ROOT, ATTENTION_OUT, "bias")]).view(-1)
+
+            self.q_proj.weight.copy_(query_weight)
+            self.k_proj.weight.copy_(key_weight)
+            self.v_proj.weight.copy_(value_weight)
+            self.o_proj.weight.copy_(out_weight)
+            self.q_proj.bias.copy_(query_bias)
+            self.k_proj.bias.copy_(key_bias)
+            self.v_proj.bias.copy_(value_bias)
+            self.o_proj.bias.copy_(out_bias)
+
+            mlp_weight_0 = np2th(weights[pjoin(ROOT, FC_0, "kernel")]).t()
+            mlp_weight_1 = np2th(weights[pjoin(ROOT, FC_1, "kernel")]).t()
+            mlp_bias_0 = np2th(weights[pjoin(ROOT, FC_0, "bias")]).t()
+            mlp_bias_1 = np2th(weights[pjoin(ROOT, FC_1, "bias")]).t()
+
+            self.fc1.weight.copy_(mlp_weight_0)
+            self.fc2.weight.copy_(mlp_weight_1)
+            self.fc1.bias.copy_(mlp_bias_0)
+            self.fc2.bias.copy_(mlp_bias_1)
+
+            self.norm1.weight.copy_(np2th(weights[pjoin(ROOT, ATTENTION_NORM, "scale")]))
+            self.norm1.bias.copy_(np2th(weights[pjoin(ROOT, ATTENTION_NORM, "bias")]))
+            self.norm2.weight.copy_(np2th(weights[pjoin(ROOT, MLP_NORM, "scale")]))
+            self.norm2.bias.copy_(np2th(weights[pjoin(ROOT, MLP_NORM, "bias")]))
+
+
 class Encoder(nn.Module):
-    def __init__(self,vis,config:B16Config):
+    def __init__(self,vis,config):
         super().__init__()
         self.config = config
         self.vis = vis
@@ -126,7 +187,7 @@ class Encoder(nn.Module):
         return x,attn_weights
 
 class Transformer(nn.Module):
-    def __init__(self,vis,config:B16Config):
+    def __init__(self,vis,config):
         super().__init__()
         self.embeddings = Embeddings(config)
         self.encoder = Encoder(vis,config)
@@ -136,7 +197,7 @@ class Transformer(nn.Module):
         return outputs,attn_weights
 
 class VisionTransformer(nn.Module):
-    def __init__(self,num_classes,zero_head,vis,config:B16Config):
+    def __init__(self,num_classes,zero_head,vis,config):
         super().__init__()
         self.num_classes = num_classes
         self.zero_head = zero_head
@@ -152,5 +213,23 @@ class VisionTransformer(nn.Module):
             return loss
         else:
             return logits,attn_weights
+    def load_from(self, weights):
+        with torch.no_grad():
+            if self.zero_head:
+                nn.init.zeros_(self.classification_head.weight)
+                nn.init.zeros_(self.classification_head.bias)
+            else:
+                self.head.weight.copy_(np2th(weights["head/kernel"]).t())
+                self.head.bias.copy_(np2th(weights["head/bias"]))
 
+
+CONFIGS = {
+    'VIT-B_16':configs.B16Config(),
+    'VIT-B_32':configs.B32Config(),
+    'VIT-L_16':configs.L16Config(),
+    'VIT-L_32':configs.L32Config(),
+    'VIT-H_14':configs.H14Config(),
+    'VIT-testing':configs.get_testing_Config(),
+    'VIT-r50_b16':configs.get_r50_b16_Config()
+}
 
