@@ -4,6 +4,8 @@ import configs
 import math
 from scipy import ndimage
 import numpy as np
+import torch.nn.functional as F
+from modeling_resnet import ResNetV2
 
 ATTENTION_Q = "MultiHeadDotProductAttention_1/query"
 ATTENTION_K = "MultiHeadDotProductAttention_1/key"
@@ -25,27 +27,39 @@ def pjoin(*parts):
     key = "/".join(parts)
     return key
 
-
-
-
 class Embeddings(nn.Module):
     def __init__(self,config):
         super().__init__()
         self.config = config
+        if config.patches.get("grid") is not None:
+            self.hybrid = True
+            patch_size = (config.image_size[0]//16//config.patches.grid[0],config.image_size[1]//16//config.patches.grid[1])
+            n_patches = config.patches.grid[0]*config.patches.grid[1]
+        else:
+            self.hybrid = False
+            patch_size = config.patches.size
+            n_patches = (config.image_size[0]//patch_size[0])*(config.image_size[1]//patch_size[1])
+        if self.hybrid:
+            self.hybrid_model = ResNetV2(config.resnet.width_factor,config.resnet.num_layers)
+            in_channels = self.hybrid_model.width*16
+        else:
+            in_channels = 3
         self.token_embeddings = nn.Conv2d(
-            in_channels=3,
+            in_channels=in_channels,
             out_channels=config.hidden_size,
-            kernel_size=16,
-            stride=16,
+            kernel_size=patch_size,
+            stride=patch_size,
             padding=0
         )
         self.CLS_token = nn.Parameter(torch.zeros(1,1,config.hidden_size))
-        self.num_patches = (config.image_size[0]//config.patches.size[0])**2
+        self.num_patches = n_patches
         self.position_embeddings = nn.Parameter(torch.zeros(1,self.num_patches+1,config.hidden_size))
         self.dropout = nn.Dropout(config.transformer.dropout)
     def forward(self,x):
+        if self.hybrid:
+            x = self.hybrid_model(x)
         x = self.token_embeddings(x)
-        x = torch.reshape(x,(-1,self.config.hidden_size,self.num_patches))
+        x = x.flatten(2)
         x = torch.transpose(x,1,2)
         CLS_tokens = self.CLS_token.expand(x.shape[0],-1,-1)
         inputs = torch.concat([CLS_tokens,x],dim=1)
@@ -98,6 +112,7 @@ class Mlp(nn.Module):
         self.fc2 = nn.Linear(config.transformer.mlp_dim,config.hidden_size)
         self.gelu = nn.GELU()
         self.dropout = nn.Dropout(config.transformer.dropout)
+        self._init_weights()
     def _init_weights(self):
         nn.init.xavier_uniform_(self.fc1.weight)
         nn.init.xavier_uniform_(self.fc2.weight)
@@ -211,7 +226,7 @@ class VisionTransformer(nn.Module):
         CLS_TOKEN = outputs[:,0,:]
         logits = self.classification_head(CLS_TOKEN)
         if labels is not None:
-            loss = nn.CrossEntropyLoss(logits,labels)
+            loss = F.cross_entropy(logits,labels)
             return loss
         else:
             return logits,attn_weights
@@ -233,7 +248,6 @@ class VisionTransformer(nn.Module):
             if posemb.size() == posemb_new.size():
                 self.transformer.embeddings.position_embeddings.copy_(posemb)
             else:
-                #logger.info("load_pretrained: resized variant: %s to %s" % (posemb.size(), posemb_new.size()))
                 ntok_new = posemb_new.size(1)
                 if self.classifier == "token":
                     posemb_tok, posemb_grid = posemb[:, :1], posemb[0, 1:]
@@ -248,17 +262,17 @@ class VisionTransformer(nn.Module):
                 posemb_grid = posemb_grid.reshape(1,-1,posemb_grid.shape[-1])
                 posemb = np.concatenate([posemb_tok,posemb_grid],axis=1)
                 self.transformer.embeddings.position_embeddings.copy_(np2th(posemb))
-                for i,block in self.transformer.encoder.layers.named_children():
-                    block.load_from(weights,n_block=i)
+            for i,block in self.transformer.encoder.layer.named_children():
+                block.load_from(weights,n_block=i)
             if self.transformer.embeddings.hybrid:
                 self.transformer.embeddings.hybrid_model.root.conv.weight.copy_(np2th(weights["conv_root/kernel"], conv=True))
                 gn_weight = np2th(weights["gn_root/scale"]).view(-1)
                 gn_bias = np2th(weights["gn_root/bias"]).view(-1)
                 self.transformer.embeddings.hybrid_model.root.gn.weight.copy_(gn_weight)
                 self.transformer.embeddings.hybrid_model.root.gn.bias.copy_(gn_bias)
-            for bname, block in self.transformer.embeddings.hybrid_model.body.named_children():
-                for uname, unit in block.named_children():
-                    unit.load_from(weights, n_block=bname, n_unit=uname)
+                for bname, block in self.transformer.embeddings.hybrid_model.body.named_children():
+                    for uname, unit in block.named_children():
+                        unit.load_from(weights, n_block=bname, n_unit=uname)
 
 
 CONFIGS = {
