@@ -1,11 +1,11 @@
 import torch
 import torch.nn as nn
-import configs
+from . import configs
 import math
 from scipy import ndimage
 import numpy as np
 import torch.nn.functional as F
-from modeling_resnet import ResNetV2
+from .modeling_resnet import ResNetV2
 
 ATTENTION_Q = "MultiHeadDotProductAttention_1/query"
 ATTENTION_K = "MultiHeadDotProductAttention_1/key"
